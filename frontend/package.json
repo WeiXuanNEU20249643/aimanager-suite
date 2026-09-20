@@ -1,0 +1,24 @@
+{
+  "name": "aimanager-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:e2e": "node ../scripts/e2e-sprint1.mjs --full",
+    "test:e2e:sprint2": "node ../scripts/e2e-sprint2.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.1.1",
+    "lucide-react": "1.47.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "recharts": "3.10.1",
+    "vite": "8.3.0"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

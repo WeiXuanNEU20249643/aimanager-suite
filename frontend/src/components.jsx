@@ -1,0 +1,20 @@
+import React from 'react';
+import {LayoutDashboard,ClipboardList,KanbanSquare,GanttChartSquare,UsersRound,Workflow,Sparkles,ShieldCheck,Settings,Search,Bell,ChevronDown,Plus,Clock,CalendarDays,CheckCircle2,AlertTriangle,Hourglass,Play,FileText,UserRound,LockKeyhole,Eye,RefreshCcw,Download,MoreHorizontal,PanelRightClose,Send,Database,Target,TrendingUp,Layers3,ArrowRight,Filter,ChevronRight,Check,Info,Shield,BookOpen,GitBranch,BrainCircuit} from 'lucide-react';
+
+export const icons={LayoutDashboard,ClipboardList,KanbanSquare,GanttChartSquare,UsersRound,Workflow,Sparkles,ShieldCheck,Settings,Search,Bell,ChevronDown,Plus,Clock,CalendarDays,CheckCircle2,AlertTriangle,Hourglass,Play,FileText,UserRound,LockKeyhole,Eye,RefreshCcw,Download,MoreHorizontal,PanelRightClose,Send,Database,Target,TrendingUp,Layers3,ArrowRight,Filter,ChevronRight,Check,Info,Shield,BookOpen,GitBranch,BrainCircuit};
+
+const nav=[['overview','项目概览',LayoutDashboard],['requirements','需求管理',ClipboardList],['kanban','任务看板',KanbanSquare],['gantt','甘特图',GanttChartSquare],['members','成员任务图',UsersRound],['uml','UML中心',Workflow],['ai','AI分析',Sparkles],['permissions','成员与权限',ShieldCheck],['settings','系统设置',Settings]];
+export function Brand(){return <div className="brand"><div className="brand-logo"><div/></div><div><b>爱管理</b><span>让项目更简单</span></div></div>}
+export function Sidebar({active,onNavigate}){return <aside className="sidebar"><Brand/><nav>{nav.map(([id,label,Icon])=><button key={id} className={active===id?'active':''} onClick={()=>onNavigate?.(id)}><Icon size={18}/><span>{label}</span></button>)}</nav><div className="promo"><b>协作成就更好的产品</b><span>从规划到实现<br/>爱管理陪伴每一步</span><div className="mountains"><i/><i/><i/></div></div></aside>}
+export function Header({user,projects=[],projectId,onProjectChange,onLogout,role}){return <header className="topbar"><div className="project-switch"><label htmlFor="project-select">当前项目</label><select id="project-select" value={projectId||''} onChange={e=>onProjectChange(Number(e.target.value))}><option value="" disabled>选择项目</option>{projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></div><div className="top-actions"><div className="user"><Avatar name={user?.name||'用户'}/><div><b>{user?.name}</b><span>{role||'暂无项目'}</span></div></div><button className="btn ghost" onClick={onLogout}>退出登录</button></div></header>}
+export function Shell({active,onNavigate,children,...headerProps}){return <div className="app"><Sidebar active={active} onNavigate={onNavigate}/><div className="work"><Header {...headerProps}/><main>{children}</main></div></div>}
+export function Avatar({name='张三',size=30}){let initials=name.slice(-2);return <span className="avatar" style={{width:size,height:size,fontSize:Math.max(10,size*.34)}}>{initials}</span>}
+export function PageTitle({title,subtitle,actions}){return <div className="page-title"><div><h1>{title}</h1><p>{subtitle}</p></div><div className="page-actions">{actions}</div></div>}
+export function Card({children,className=''}){return <section className={'card '+className}>{children}</section>}
+export function Metric({icon:Icon,label,value,sub,tone='blue'}){return <Card className="metric"><div className={'metric-icon '+tone}><Icon size={20}/></div><div><span>{label}</span><b>{value}</b><small>{sub}</small></div></Card>}
+export function Tag({children,tone='blue'}){return <span className={'tag '+tone}>{children}</span>}
+export function PrimaryButton({children,icon:Icon=Plus,...props}){return <button className="btn primary" {...props}>{Icon&&<Icon size={16}/>} {children}</button>}
+export function GhostButton({children,icon:Icon,...props}){return <button className="btn ghost" {...props}>{Icon&&<Icon size={16}/>} {children}</button>}
+export function FilterSelect({label,value='全部'}){return <label className="filter-select"><small>{label}</small><span>{value}<ChevronDown size={14}/></span></label>}
+export function Progress({value,tone='blue'}){return <div className="progress"><i className={tone} style={{width:value+'%'}}/></div>}
+export function SectionHead({title,right}){return <div className="section-head"><h3>{title}</h3>{right}</div>}
