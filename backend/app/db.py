@@ -26,7 +26,7 @@ def connect(path=None):
 def migrate(path=None):
     with connect(path) as db:
         version = db.execute('PRAGMA user_version').fetchone()[0]
-        if version > 3:
+        if version > 4:
             raise RuntimeError('Database schema is newer than this application')
         if version == 0:
             db.executescript('''
@@ -184,5 +184,34 @@ def migrate(path=None):
             CREATE INDEX member_capacities_project ON member_capacities(project_id);
             CREATE INDEX tasks_plan_dates ON tasks(project_id,planned_start,planned_end);
             PRAGMA user_version=3;
+            COMMIT;
+            ''')
+            version = 3
+        if version == 3:
+            db.executescript('''
+            BEGIN IMMEDIATE;
+            CREATE TABLE project_plan_state (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id),
+                version INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
+                updated_by INTEGER REFERENCES users(id)
+            );
+            CREATE TABLE plan_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                plan_version INTEGER NOT NULL,
+                requirement_pk INTEGER NOT NULL,
+                requirement_version INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('applied','blocked')),
+                changes_json TEXT NOT NULL,
+                conflicts_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                triggered_by INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id,plan_version),
+                FOREIGN KEY(project_id,requirement_pk) REFERENCES requirements(project_id,pk)
+            );
+            CREATE INDEX plan_runs_requirement ON plan_runs(project_id,requirement_pk,id DESC);
+            PRAGMA user_version=4;
             COMMIT;
             ''')

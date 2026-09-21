@@ -7,12 +7,15 @@ import {Requirements} from './sprint1/Requirements';
 import {Permissions} from './sprint1/Permissions';
 import {Tasks} from './sprint1/Tasks';
 import {Overview} from './sprint2/Overview';
+import {Gantt} from './sprint3/Gantt';
+import {MemberTasks} from './sprint3/MemberTasks';
 import {readRoute, navigate, roleLabel, useResource} from './sprint1/shared';
 import {Empty, ErrorNotice, Loading, Preview} from './sprint1/ui';
 import './styles.css';
 import './sprint1/styles.css';
+import './sprint3/styles.css';
 
-const previewNames = {gantt: 'Gantt', members: 'MemberTasks', uml: 'UML', ai: 'AIAnalysis', settings: 'SettingsPage'};
+const previewNames = {uml: 'UML', ai: 'AIAnalysis', settings: 'SettingsPage'};
 const previews = Object.fromEntries(Object.entries(previewNames).map(([key, name]) => [key, lazy(() => import('./pages').then(module => ({default: module[name]})))]));
 
 function App() {
@@ -42,7 +45,7 @@ function Workspace({user, route, onLogout}) {
   const preview = previews[route.page];
   const PreviewPage = preview;
   return <Shell active={route.page === 'tasks' ? 'kanban' : route.page} onNavigate={p => navigate(p, project?.id)} user={user} projects={projects.data || []} projectId={project?.id} role={roleLabel(project)} onProjectChange={id => navigate(route.page === 'login' ? 'overview' : route.page, id)} onLogout={logout}><ErrorNotice error={error}/>{projects.loading ? <Loading/> : projects.error ? <ErrorNotice error={projects.error} retry={projects.reload}/> : !project ? <Card><Empty>{projects.data.length ? '此项目不存在或您已无访问权限，请在顶部选择项目。' : '暂无获授权项目，请联系管理员将您的账号加入项目。'}</Empty><GhostButton onClick={projects.reload}>刷新项目权限</GhostButton></Card> : <div key={`${project.id}-${project.role}-${project.role_id || ''}`}>
-    {route.page === 'requirements' ? <Requirements project={project} route={route}/> : ['kanban','tasks'].includes(route.page) ? <Tasks project={project} route={route}/> : route.page === 'permissions' ? <Permissions project={project} onMembershipChange={projects.reload}/> : preview ? <Suspense fallback={<Loading/>}><Preview sprint={{gantt:'Sprint 3',members:'Sprint 3',uml:'Sprint 4',ai:'Sprint 5–6'}[route.page] || '后续迭代'}><PreviewPage/></Preview></Suspense> : ['overview','login'].includes(route.page) ? <Overview project={project}/> : <Card><Empty>页面不存在</Empty><GhostButton onClick={() => navigate('overview',project.id)}>返回概览</GhostButton></Card>}
+    {route.page === 'requirements' ? <Requirements project={project} route={route}/> : ['kanban','tasks'].includes(route.page) ? <Tasks project={project} route={route}/> : route.page === 'gantt' ? <Gantt project={project}/> : route.page === 'members' ? <MemberTasks project={project}/> : route.page === 'permissions' ? <Permissions project={project} onMembershipChange={projects.reload}/> : preview ? <Suspense fallback={<Loading/>}><Preview sprint={{uml:'Sprint 4',ai:'Sprint 5–6'}[route.page] || '后续迭代'}><PreviewPage/></Preview></Suspense> : ['overview','login'].includes(route.page) ? <Overview project={project}/> : <Card><Empty>页面不存在</Empty><GhostButton onClick={() => navigate('overview',project.id)}>返回概览</GhostButton></Card>}
   </div>}</Shell>;
 }
 createRoot(document.getElementById('root')).render(<App/>);

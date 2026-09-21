@@ -16,7 +16,10 @@ from .db import connect, migrate
 from .schemas import (
     BlockerIn, CapacityIn, CustomRoleEdit, CustomRoleIn, DependencyIn, DependencyRemoveIn,
     LoginIn, MemberIn, MilestoneEdit, MilestoneIn, RequirementEdit, RequirementIn,
-    RoleIn, StatusIn, TaskActionIn, TaskEdit, TaskIn, TaskPlanIn, TaskSourceIn,
+    ReplanIn, RoleIn, StatusIn, TaskActionIn, TaskEdit, TaskIn, TaskPlanIn, TaskSourceIn,
+)
+from .planning import (
+    calculate_replan, plan_state, planning_impact, planning_snapshot, touch_plan_state,
 )
 from .security import hash_password, token_hash, verify_password
 
@@ -53,11 +56,13 @@ def fail(status, message):
     raise HTTPException(status, message)
 
 
-def event(db, project_id, kind, entity_id, action, actor, before, after, reason=''):
+def event(db, project_id, kind, entity_id, action, actor, before, after, reason='', touch_plan=True):
     db.execute('INSERT INTO events(project_id,entity_type,entity_id,event_type,actor_id,occurred_at,before_json,after_json,reason,operation_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
                (project_id, kind, entity_id, action, actor, now(),
                 json.dumps(before, ensure_ascii=False) if before is not None else None,
                 json.dumps(after, ensure_ascii=False), reason, str(uuid.uuid4())))
+    if touch_plan and kind in {'task', 'task_dependency', 'member_capacity', 'membership', 'requirement'}:
+        touch_plan_state(db, project_id, actor, now())
 
 
 def key(value, prefix):
@@ -207,13 +212,29 @@ def milestone(db, project_id, milestone_id):
     return result
 
 
+def plan_runs(db, project_id, requirement_pk, limit=10):
+    rows = db.execute('''SELECT pr.*,u.name triggered_by_name FROM plan_runs pr
+        JOIN users u ON u.id=pr.triggered_by
+        WHERE pr.project_id=? AND pr.requirement_pk=? ORDER BY pr.id DESC LIMIT ?''',
+        (project_id, requirement_pk, limit)).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item['changes'] = json.loads(item.pop('changes_json'))
+        item['conflicts'] = json.loads(item.pop('conflicts_json'))
+        item['requirement_id'] = f"REQ-{item.pop('requirement_pk'):03d}"
+        item['applied'] = item['status'] == 'applied'
+        result.append(item)
+    return result
+
+
 def create_app(db_path=None):
     @asynccontextmanager
     async def lifespan(app):
         migrate(db_path)
         yield
 
-    app = FastAPI(title='爱管理 API', version='2.0.0', lifespan=lifespan)
+    app = FastAPI(title='爱管理 API', version='3.0.0', lifespan=lifespan)
 
     @app.middleware('http')
     async def request_guard(request, call_next):
@@ -475,6 +496,84 @@ def create_app(db_path=None):
         return {'tasks': items, 'active_count': len(active),
                 'completed_count': sum(item['status'] == '已完成' for item in active)}
 
+    @app.get('/api/projects/{project_id}/requirements/{req_id}/planning-impact')
+    def requirement_planning_impact(project_id: int, req_id: str, actor=Depends(requirement_reader),
+                                    db=Depends(database, scope='function')):
+        if 'task.read' not in actor['permissions']:
+            fail(403, '查看排期影响需要任务读取权限')
+        source = requirement(db, project_id, req_id)
+        impact = planning_impact(db, project_id, key(req_id, 'REQ'),
+            lambda pk: task(db, project_id, f'T-{pk:03d}'))
+        runs = plan_runs(db, project_id, key(req_id, 'REQ'), 5)
+        return {**impact, 'requirement_id': req_id, 'requirement_version': source['version'],
+                'plan': plan_state(db, project_id), 'latest_run': runs[0] if runs else None}
+
+    @app.get('/api/projects/{project_id}/requirements/{req_id}/planning-runs')
+    def requirement_plan_runs(project_id: int, req_id: str, actor=Depends(requirement_reader),
+                              db=Depends(database, scope='function')):
+        if 'task.read' not in actor['permissions']:
+            fail(403, '查看排期记录需要任务读取权限')
+        requirement(db, project_id, req_id)
+        return plan_runs(db, project_id, key(req_id, 'REQ'))
+
+    @app.post('/api/projects/{project_id}/requirements/{req_id}/replan')
+    def replan_requirement(project_id: int, req_id: str, body: ReplanIn, actor=Depends(admin),
+                           db=Depends(database, scope='function')):
+        source = requirement(db, project_id, req_id)
+        if body.requirement_version != source['version']:
+            fail(409, '需求已被更新，请刷新影响清单后重试')
+        current_plan = plan_state(db, project_id)
+        if body.plan_version != current_plan['version']:
+            fail(409, '任务或容量数据已变化，请刷新影响清单后重试')
+        calculation = calculate_replan(db, project_id, key(req_id, 'REQ'),
+            lambda pk: task(db, project_id, f'T-{pk:03d}'),
+            lambda user_id: capacity(db, project_id, user_id))
+        stamp = now()
+        proposal_records = [{k: v for k, v in proposal.items() if k not in ('pk', 'before')}
+                            for proposal in calculation['proposals']]
+        plan_version = touch_plan_state(db, project_id, actor['id'], stamp)
+        if calculation['blocked']:
+            db.execute('''INSERT INTO plan_runs(project_id,plan_version,requirement_pk,requirement_version,status,
+                changes_json,conflicts_json,reason,triggered_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                (project_id, plan_version, key(req_id, 'REQ'), source['version'], 'blocked',
+                 json.dumps(proposal_records, ensure_ascii=False),
+                 json.dumps(calculation['conflicts'], ensure_ascii=False), body.reason, actor['id'], stamp))
+            return {'applied': False, 'plan_version': plan_version, 'changes': proposal_records,
+                    'conflicts': calculation['conflicts'], 'message': '存在无法自动排期的冲突，未修改任何任务'}
+
+        changed_events = []
+        for proposal in calculation['proposals']:
+            review_value = 0 if proposal['pk'] in calculation['direct'] else int(proposal['before']['review_required'])
+            db.execute('''UPDATE tasks SET planned_start=?,planned_end=?,review_required=?,version=version+1,updated_at=?
+                WHERE project_id=? AND pk=?''',
+                (proposal['after_start'], proposal['after_end'], review_value, stamp, project_id, proposal['pk']))
+            after = task(db, project_id, proposal['task_id'])
+            changed_events.append((proposal['before'], after, 'plan_recalculated'))
+        proposed_pks = {proposal['pk'] for proposal in calculation['proposals']}
+        for pk in calculation['direct'] - proposed_pks:
+            before = task(db, project_id, f'T-{pk:03d}')
+            if before['cancelled'] or not before['review_required']:
+                continue
+            db.execute('''UPDATE tasks SET review_required=0,version=version+1,updated_at=?
+                WHERE project_id=? AND pk=?''', (stamp, project_id, pk))
+            changed_events.append((before, task(db, project_id, before['id']), 'plan_review_confirmed'))
+        applied_changes = []
+        for before, after, action in changed_events:
+            applied_changes.append({'task_id': after['id'], 'action': action,
+                'before_start': before['planned_start'], 'before_end': before['planned_end'],
+                'after_start': after['planned_start'], 'after_end': after['planned_end'],
+                'task_version': after['version']})
+        db.execute('''INSERT INTO plan_runs(project_id,plan_version,requirement_pk,requirement_version,status,
+            changes_json,conflicts_json,reason,triggered_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+            (project_id, plan_version, key(req_id, 'REQ'), source['version'], 'applied',
+             json.dumps(applied_changes, ensure_ascii=False),
+             json.dumps(calculation['conflicts'], ensure_ascii=False), body.reason, actor['id'], stamp))
+        for before, after, action in changed_events:
+            event(db, project_id, 'task', after['id'], action, actor['id'], before, after,
+                  body.reason, touch_plan=False)
+        return {'applied': True, 'plan_version': plan_version, 'changes': applied_changes,
+                'conflicts': calculation['conflicts'], 'message': '排期已按依赖和成员容量更新'}
+
     @app.get('/api/projects/{project_id}/tasks')
     def tasks(project_id: int, q: str = '', status: str = '', owner_id: str = '',
               cancelled: str = 'active',
@@ -509,6 +608,12 @@ def create_app(db_path=None):
         elif owner_id:
             items = [item for item in items if item['owner_id'] == parsed_owner]
         return items
+
+    @app.get('/api/projects/{project_id}/planning')
+    def project_planning(project_id: int, actor=Depends(task_reader), db=Depends(database, scope='function')):
+        return planning_snapshot(db, project_id,
+            lambda pk: task(db, project_id, f'T-{pk:03d}'),
+            lambda user_id: capacity(db, project_id, user_id))
 
     @app.get('/api/projects/{project_id}/tasks/{task_id}')
     def get_task(project_id: int, task_id: str, actor=Depends(task_reader), db=Depends(database, scope='function')):

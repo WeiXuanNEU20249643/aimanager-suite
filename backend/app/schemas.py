@@ -145,6 +145,12 @@ class CapacityIn(Input):
         return self
 
 
+class ReplanIn(Input):
+    requirement_version: int = Field(gt=0)
+    plan_version: int = Field(ge=0)
+    reason: LongText
+
+
 class MilestoneIn(Input):
     name: Text
     target_date: date

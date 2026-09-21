@@ -21,7 +21,16 @@
 
 项目概览、需求管理、任务列表／看板和成员容量已经接入 Sprint 2 真实接口。上一版已完成的 US10 里程碑、US20 任务源需求改绑，以及 US22／US23／US25 自定义角色能力，在融合版中属于候选未排期功能，继续保留作为可复用增量，不计入本轮八条 Must。
 
-甘特、成员任务图、UML、AI 和设置页面保留原始设计预览，明确标注示例数据并禁用交互。后续按 Sprint 3—6 逐步接入；预览不代表功能已交付。
+Sprint 2 结束时，甘特、成员任务图、UML、AI 和设置页面仍为原始设计预览；Sprint 3 在此基础上只接入甘特和成员任务图，没有提前实现后续迭代。
+
+## Sprint 3
+
+- US34：甘特图从统一排期接口读取真实任务、计划日期、负责人、工时与依赖；任务条进入同一任务详情，未排期和已取消任务明确分开。
+- US35：成员任务图按有效成员、已移除历史负责人和未分配任务分组，以剩余工时和计划期容量计算负荷，不把任务数量当作绩效。
+- US36：需求详情提供排期影响清单；内置管理员确认后，服务端按依赖、成员可用时段和容量原子重排待办且未锁定任务，保留已完成、进行中、待验收和锁定任务的承诺日期，并保存排期版本、旧新日期、冲突及操作者。
+- US37：看板、甘特和成员任务图共享任务 ID、状态、负责人、取消标记和任务版本；成员任务图每 5 秒静默重读，网络失败不以旧数据覆盖新版本。
+
+甘特、成员任务图和需求排期影响均已接入真实 FastAPI + SQLite 数据。UML、AI 和设置页面继续保留原始设计预览，明确标注示例数据并禁用交互，后续按 Sprint 4—6 增量接入。
 
 ## 首次运行 Windows PowerShell
 
@@ -59,7 +68,7 @@ npm run dev
 
 ## 数据库与升级
 
-默认数据库为 `backend/data/aimanager.sqlite3`，与工作目录无关。可在启动前设置 `$env:AIMANAGER_DB='绝对路径'`。程序启动自动执行增量迁移；也可单独执行 `python -m app.manage migrate`。Sprint 2 通过 schema 2 保留需求版本、角色权限、依赖和里程碑结构，并以 schema 3 增量加入任务工时／排期和成员容量结构。重复迁移保留数据；遇到高于程序支持的版本直接拒绝启动。没有自动导入原 Mock 数据，不会把规划故事编号冒充产品运行数据。
+默认数据库为 `backend/data/aimanager.sqlite3`，与工作目录无关。可在启动前设置 `$env:AIMANAGER_DB='绝对路径'`。程序启动自动执行增量迁移；也可单独执行 `python -m app.manage migrate`。Sprint 2 通过 schema 2 保留需求版本、角色权限、依赖和里程碑结构，并以 schema 3 增量加入任务工时／排期和成员容量结构；Sprint 3 的 schema 4 新增项目排期版本和需求重排记录。重复迁移保留数据；遇到高于程序支持的版本直接拒绝启动。没有自动导入原 Mock 数据，不会把规划故事编号冒充产品运行数据。
 
 升级前停止后端并备份数据库文件。后续版本必须增加迁移分支和迁移回归用例，不能删除或覆盖数据库。原工程只有内存数组，没有需要搬迁的既有 SQLite 业务数据。需求号 `REQ-001…` 和任务号 `T-001…` 由数据库自增主键生成，全库唯一且稳定，所有读取仍按项目授权。
 
@@ -71,11 +80,13 @@ npm run dev
 - `#requirements?project=1`、`#requirements/REQ-001?project=1`：需求列表／详情。
 - `#kanban?project=1`、`#kanban/T-001?project=1`：四列看板／任务详情。
 - `#tasks?project=1`、`#tasks/T-001?project=1`：任务列表／同一详情。
+- `#gantt?project=1`：真实任务甘特图、未排期清单和共享排期版本。
+- `#members?project=1`：真实成员任务分组、容量负荷和 5 秒同步。
 - `#permissions?project=1`：项目成员及角色。
 
 详情支持刷新、浏览器前进后退；未登录先登录再回到目标地址。顶部选择项目会清除上个项目的对象编号。无权限、空结果、加载失败分别提示；失败不会回退为 Mock。
 
-`frontend/src/components.jsx` 与 `styles.css` 继续提供统一视觉组件。`src/api.js` 是唯一网络适配层；`src/sprint1/` 保留共用加载逻辑并增量扩展需求、任务和权限页，`src/sprint2/Overview.jsx` 提供真实概览；`pages.jsx`、`mock.js` 仅供尚未接入页面的设计预览。后端 `db.py` 管理数据库与迁移，`schemas.py` 约束输入，`security.py` 管理散列，`main.py` 提供统一项目授权与 API。SQLite 使用 Python 标准库事务；没有另建项目或服务。
+`frontend/src/components.jsx` 与 `styles.css` 继续提供统一视觉组件。`src/api.js` 是唯一网络适配层；`src/sprint1/` 保留共用加载逻辑并增量扩展需求、任务和权限页，`src/sprint2/Overview.jsx` 提供真实概览，`src/sprint3/` 提供甘特、成员任务图和静默同步；`pages.jsx`、`mock.js` 仅供尚未接入页面的设计预览。后端 `db.py` 管理数据库与迁移，`schemas.py` 约束输入，`planning.py` 负责排期影响、容量计算和重排规则，`main.py` 提供统一项目授权与 API。SQLite 使用 Python 标准库事务；没有另建项目或服务。
 
 ## 测试
 
@@ -90,8 +101,9 @@ npm run build
 npx playwright install chromium
 npm run test:e2e
 npm run test:e2e:sprint2
+npm run test:e2e:sprint3
 ```
 
 Windows 已安装 Edge 时，可设置 `$env:PLAYWRIGHT_CHANNEL='msedge'` 使用 Edge 无头测试，无需下载 Chromium。浏览器测试自动启动独立端口 18000／15173，使用临时 SQLite、随机测试密码及明确标注的测试项目，结束时停止服务并清理临时目录，不改正式库。截图输出在忽略目录 `artifacts/`。可用 `AIMANAGER_TEST_PYTHON` 指定测试 Python 路径。
 
-Sprint 1 的历史验证和契约见 `docs/sprint1-validation.md`、`docs/api-sprint1.md`；Sprint 2 见 `docs/sprint2-validation.md`、`docs/api-sprint2.md` 和 `docs/sprint2-handover.md`。当前目录没有 Git 元数据，尚未执行远端 CI，也不把自动化测试当成人工独立验收签认。
+Sprint 1 的历史验证和契约见 `docs/sprint1-validation.md`、`docs/api-sprint1.md`；Sprint 2 见 `docs/sprint2-validation.md`、`docs/api-sprint2.md` 和 `docs/sprint2-handover.md`；Sprint 3 见 `docs/sprint3-validation.md`、`docs/api-sprint3.md` 和 `docs/sprint3-handover.md`。自动化结果为本地验证，不替代非作者人工复验、产品接受或远端 CI。
