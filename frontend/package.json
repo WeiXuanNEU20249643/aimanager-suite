@@ -9,7 +9,10 @@
     "preview": "vite preview",
     "test:e2e": "node ../scripts/e2e-sprint1.mjs --full",
     "test:e2e:sprint2": "node ../scripts/e2e-sprint2.mjs",
-    "test:e2e:sprint3": "node ../scripts/e2e-sprint3.mjs"
+    "test:e2e:sprint3": "node ../scripts/e2e-sprint3.mjs",
+    "test:e2e:sprint4": "node ../scripts/e2e-sprint4.mjs",
+    "test:e2e:sprint5": "node ../scripts/e2e-sprint5.mjs",
+    "test:e2e:sprint6": "node ../scripts/e2e-sprint6.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.1.1",

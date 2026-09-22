@@ -20,7 +20,7 @@ export async function api(path, options = {}) {
     if ([401, 403].includes(response.status) && !path.startsWith('/auth/')) {
       window.dispatchEvent(new CustomEvent('api-access-error', {detail: response.status}));
     }
-    throw new ApiError(data?.detail || '请求失败，请稍后重试', response.status);
+    throw new ApiError(data?.detail || data?.error_message || '请求失败，请稍后重试', response.status);
   }
   return data;
 }
