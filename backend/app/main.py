@@ -14,14 +14,27 @@ from fastapi.responses import JSONResponse
 
 from .db import connect, migrate
 from .schemas import (
+    AIEfficiencyIn, AIForecastIn, AIOutputEditIn, AIPRDBreakdownIn, AIQualityIn,
+    AIReviewIn, AIRiskIn, AIScheduleIn,
     BlockerIn, CapacityIn, CustomRoleEdit, CustomRoleIn, DependencyIn, DependencyRemoveIn,
-    LoginIn, MemberIn, MilestoneEdit, MilestoneIn, RequirementEdit, RequirementIn,
-    ReplanIn, RoleIn, StatusIn, TaskActionIn, TaskEdit, TaskIn, TaskPlanIn, TaskSourceIn,
+    ImprovementActionEditIn, LoginIn, MemberIn, MilestoneEdit, MilestoneIn, RequirementEdit, RequirementIn,
+    ReplanIn, RoleIn, SequenceGenerateIn, SequenceScenarioEdit, SequenceScenarioIn,
+    StatusIn, TaskActionIn, TaskEdit, TaskIn, TaskPlanIn, TaskSourceIn, UseCaseGenerateIn,
+)
+from .ai import (
+    AIServiceError, ai_settings, breakdown_prompt, call_structured, forecast_calculation,
+    efficiency_calculation, efficiency_prompt, forecast_prompt, latest_risk_thresholds,
+    list_risk_thresholds, list_runs as list_ai_runs, load_run as load_ai_run, normalize_breakdown,
+    public_ai_settings, public_provider_url, quality_prompt, risk_calculation, risk_prompt,
+    save_run as save_ai_run, schedule_calculation, schedule_prompt, validate_efficiency_analysis,
+    validate_forecast_explanation, validate_quality_analysis, validate_review_output,
+    validate_risk_analysis, validate_schedule_explanation,
 )
 from .planning import (
     calculate_replan, plan_state, planning_impact, planning_snapshot, touch_plan_state,
 )
 from .security import hash_password, token_hash, verify_password
+from .uml import build_sequence, build_use_case, latest_generation, save_generation, scenario, scenarios
 
 COOKIE = 'aimanager_session'
 SESSION_SECONDS = 12 * 60 * 60
@@ -31,12 +44,13 @@ PERMISSIONS = (
     'requirement.read', 'requirement.write', 'requirement.history',
     'task.read', 'task.write', 'comment.read', 'comment.write',
     'milestone.read', 'milestone.write', 'statistics.read', 'history.read',
+    'uml.read', 'uml.write', 'ai.read', 'ai.write', 'ai.apply',
 )
 BUILTIN_PERMISSIONS = {
     'admin': set(PERMISSIONS),
     'member': set(PERMISSIONS) - {'milestone.write'},
     'observer': {'requirement.read', 'requirement.history', 'task.read',
-                 'comment.read', 'milestone.read', 'statistics.read', 'history.read'},
+                 'comment.read', 'milestone.read', 'statistics.read', 'history.read', 'uml.read', 'ai.read'},
 }
 
 
@@ -82,6 +96,7 @@ def requirement(db, project_id, req_id):
     result['id'] = f"REQ-{result.pop('pk'):03d}"
     result['priority'] = result.get('priority') or 'Must'
     result['acceptance_criteria'] = result.get('acceptance_criteria') or '待补充验收条件'
+    result['story_role'] = result.get('story_role') or ''
     return result
 
 
@@ -105,6 +120,7 @@ def task(db, project_id, task_id):
     result['cancelled'] = bool(result.get('cancelled_at'))
     result['plan_locked'] = bool(result.get('plan_locked'))
     result['manually_blocked'] = bool(result.get('manual_block_reason'))
+    result['required_skills'] = json.loads(result.pop('required_skills_json') or '[]')
     dependencies = [dict(r) for r in db.execute('''SELECT d.depends_on_pk,t.title,t.status,t.cancelled_at,d.reason,u.name actor_name,d.created_at
         FROM task_dependencies d JOIN tasks t ON t.project_id=d.project_id AND t.pk=d.depends_on_pk
         JOIN users u ON u.id=d.created_by WHERE d.project_id=? AND d.task_pk=? ORDER BY d.created_at,d.depends_on_pk''',
@@ -228,13 +244,38 @@ def plan_runs(db, project_id, requirement_pk, limit=10):
     return result
 
 
+def improvement_action(db, project_id, action_id):
+    row = db.execute('''SELECT ia.*,owner.name owner_name,creator.name created_by_name,
+        updater.name updated_by_name FROM improvement_actions ia
+        JOIN users owner ON owner.id=ia.owner_id
+        JOIN users creator ON creator.id=ia.created_by
+        JOIN users updater ON updater.id=ia.updated_by
+        WHERE ia.project_id=? AND ia.id=?''', (project_id, action_id)).fetchone()
+    if not row:
+        fail(404, '改进行动不存在')
+    return dict(row)
+
+
+def improvement_actions(db, project_id):
+    rows = db.execute('''SELECT id FROM improvement_actions WHERE project_id=?
+        ORDER BY CASE status WHEN '进行中' THEN 0 WHEN '待处理' THEN 1 ELSE 2 END,id DESC''',
+        (project_id,)).fetchall()
+    return [improvement_action(db, project_id, row['id']) for row in rows]
+
+
+def ai_members(db, project_id):
+    return [dict(row) for row in db.execute('''SELECT u.id,u.name,m.role FROM memberships m
+        JOIN users u ON u.id=m.user_id WHERE m.project_id=? AND m.active=1 AND u.active=1
+        AND m.role<>'observer' ORDER BY u.id''', (project_id,))]
+
+
 def create_app(db_path=None):
     @asynccontextmanager
     async def lifespan(app):
         migrate(db_path)
         yield
 
-    app = FastAPI(title='爱管理 API', version='3.0.0', lifespan=lifespan)
+    app = FastAPI(title='爱管理 API', version='6.0.0', lifespan=lifespan)
 
     @app.middleware('http')
     async def request_guard(request, call_next):
@@ -295,11 +336,50 @@ def create_app(db_path=None):
     milestone_writer = permitted('milestone.write')
     statistics_reader = permitted('statistics.read')
     history_reader = permitted('history.read')
+    uml_reader = permitted('uml.read')
+    uml_writer = permitted('uml.write')
+    ai_reader = permitted('ai.read')
+    ai_writer = permitted('ai.write')
+    ai_applier = permitted('ai.apply')
 
     def admin(actor=Depends(access)):
         if actor['role'] != 'admin':
             fail(403, '仅项目管理员可执行此操作')
         return actor
+
+    def validated_scenario_payload(project_id, body, db):
+        participants = list(body.participants)
+        normalized = [value.casefold() for value in participants]
+        if len(normalized) != len(set(normalized)):
+            fail(422, '参与者名称不能重复')
+        for index, participant in enumerate(participants, start=1):
+            if any(ord(char) < 32 for char in participant):
+                fail(422, f'第{index}个参与者包含不可生成的控制字符')
+        participant_names = set(participants)
+        messages = []
+        for index, item in enumerate(body.messages, start=1):
+            if item.from_participant not in participant_names:
+                fail(422, f'第{index}条消息的发送方不在参与者清单中')
+            if item.to_participant not in participant_names:
+                fail(422, f'第{index}条消息的接收方不在参与者清单中')
+            for value in (item.label, item.branch_condition):
+                if any(ord(char) < 32 for char in value):
+                    fail(422, f'第{index}条消息包含不可生成的控制字符')
+            if not item.task_id:
+                fail(422, f'第{index}条消息缺少来源任务ID')
+            try:
+                linked_task = task(db, project_id, item.task_id)
+            except HTTPException:
+                fail(422, f'第{index}条消息的来源任务不存在或不属于当前项目')
+            messages.append({**item.model_dump(), 'task_id': linked_task['id']})
+        return participants, messages
+
+    def resume_after_ai_call(db, project_id, actor, permission):
+        db.execute('BEGIN IMMEDIATE')
+        current = member_access(db, project_id, actor)
+        if permission not in current['permissions']:
+            fail(403, 'AI 调用完成前权限已变化，结果未保存')
+        return current
 
     @app.get('/api/health')
     def health(db=Depends(database, scope='function')):
@@ -425,13 +505,15 @@ def create_app(db_path=None):
         rows = db.execute('SELECT pk FROM requirements WHERE project_id=? ORDER BY pk DESC', (project_id,))
         result = [requirement(db, project_id, f"REQ-{r['pk']:03d}") for r in rows]
         query = q.strip().casefold()
-        return [r for r in result if query in ' '.join(str(r[k]) for k in ('id', 'title', 'description', 'source')).casefold()]
+        return [r for r in result if query in ' '.join(str(r[k]) for k in
+            ('id', 'title', 'description', 'source', 'story_role')).casefold()]
 
     @app.post('/api/projects/{project_id}/requirements', status_code=201)
     def create_requirement(project_id: int, body: RequirementIn, actor=Depends(requirement_writer), db=Depends(database, scope='function')):
-        pk = db.execute('''INSERT INTO requirements(project_id,title,description,source,priority,acceptance_criteria,created_by,created_at)
-            VALUES(?,?,?,?,?,?,?,?)''', (project_id, body.title, body.description, body.source,
-            body.priority, body.acceptance_criteria, actor['id'], now())).lastrowid
+        pk = db.execute('''INSERT INTO requirements(project_id,title,description,source,priority,acceptance_criteria,
+            story_role,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)''',
+            (project_id, body.title, body.description, body.source, body.priority,
+             body.acceptance_criteria, body.story_role, actor['id'], now())).lastrowid
         result = requirement(db, project_id, f'REQ-{pk:03d}')
         event(db, project_id, 'requirement', result['id'], 'created', actor['id'], None, result)
         return result
@@ -450,13 +532,15 @@ def create_app(db_path=None):
             'SELECT pk FROM tasks WHERE project_id=? AND requirement_pk=? AND cancelled_at IS NULL ORDER BY pk',
             (project_id, key(req_id, 'REQ')))]
         changed_at = now()
+        new_story_role = old['story_role'] if body.story_role is None else body.story_role
         db.execute('''INSERT INTO requirement_versions(project_id,requirement_pk,version,title,description,source,priority,
-            acceptance_criteria,changed_by,changed_at,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+            acceptance_criteria,story_role,changed_by,changed_at,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
             (project_id, key(req_id, 'REQ'), old['version'], old['title'], old['description'], old['source'],
-             old['priority'], old['acceptance_criteria'], actor['id'], changed_at, body.reason))
-        db.execute('''UPDATE requirements SET title=?,description=?,source=?,priority=?,acceptance_criteria=?,version=version+1
-            WHERE project_id=? AND pk=?''', (body.title, body.description, body.source, body.priority,
-            body.acceptance_criteria, project_id, key(req_id, 'REQ')))
+             old['priority'], old['acceptance_criteria'], old['story_role'], actor['id'], changed_at, body.reason))
+        db.execute('''UPDATE requirements SET title=?,description=?,source=?,priority=?,acceptance_criteria=?,
+            story_role=?,version=version+1 WHERE project_id=? AND pk=?''',
+            (body.title, body.description, body.source, body.priority, body.acceptance_criteria,
+             new_story_role, project_id, key(req_id, 'REQ')))
         db.execute('''UPDATE tasks SET review_required=1,version=version+1,updated_at=?
             WHERE project_id=? AND requirement_pk=? AND cancelled_at IS NULL''',
             (changed_at, project_id, key(req_id, 'REQ')))
@@ -480,7 +564,8 @@ def create_app(db_path=None):
             ORDER BY e.id DESC LIMIT 1''', (project_id, req_id)).fetchone()
         current_change = dict(latest) if latest else {'changed_by': current['created_by'],
             'changed_by_name': current['creator_name'], 'changed_at': current['created_at'], 'reason': '初始版本'}
-        rows.insert(0, {**{k: current[k] for k in ('version', 'title', 'description', 'source', 'priority', 'acceptance_criteria')},
+        rows.insert(0, {**{k: current[k] for k in ('version', 'title', 'description', 'source', 'priority',
+                                                    'acceptance_criteria', 'story_role')},
                         **current_change})
         return rows
 
@@ -573,6 +658,584 @@ def create_app(db_path=None):
                   body.reason, touch_plan=False)
         return {'applied': True, 'plan_version': plan_version, 'changes': applied_changes,
                 'conflicts': calculation['conflicts'], 'message': '排期已按依赖和成员容量更新'}
+
+    @app.get('/api/projects/{project_id}/ai')
+    def ai_center(project_id: int, actor=Depends(ai_reader), db=Depends(database, scope='function')):
+        runs = list_ai_runs(db, project_id)
+        thresholds = latest_risk_thresholds(db, project_id)
+        return {'service': public_ai_settings(), 'plan_version': plan_state(db, project_id)['version'],
+                'runs': runs, 'draft_count': sum(item['status'] == 'draft' for item in runs),
+                'failed_count': sum(item['status'] == 'failed' for item in runs),
+                'risk_thresholds': thresholds,
+                'risk_threshold_history': list_risk_thresholds(db, project_id),
+                'members': ai_members(db, project_id),
+                'quality_targets': [{'id': f"REQ-{row['pk']:03d}", 'title': row['title']}
+                                    for row in db.execute('''SELECT pk,title FROM requirements
+                                        WHERE project_id=? ORDER BY pk''', (project_id,))],
+                'actions': improvement_actions(db, project_id)}
+
+    @app.get('/api/projects/{project_id}/ai/runs/{run_id}')
+    def get_ai_run(project_id: int, run_id: int, actor=Depends(ai_reader),
+                   db=Depends(database, scope='function')):
+        result = load_ai_run(db, project_id, run_id)
+        if not result:
+            fail(404, 'AI 记录不存在')
+        return result
+
+    @app.post('/api/projects/{project_id}/ai/prd-breakdowns', status_code=201)
+    def generate_prd_breakdown(project_id: int, body: AIPRDBreakdownIn, response: Response,
+                               actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        if not {'requirement.read', 'task.read'}.issubset(actor['permissions']):
+            fail(403, 'AI 需求拆解需要读取需求和任务的权限')
+        input_version = plan_state(db, project_id)['version']
+        input_data = {'source_name': body.source_name, 'prd_text': body.prd_text}
+        settings = ai_settings()
+        model_id, provider_url = settings['model_id'], public_provider_url(settings['endpoint'])
+        db.commit()
+        failure = None
+        output = None
+        try:
+            raw, model_id, provider_url = call_structured('prd_breakdown', breakdown_prompt(), input_data)
+            output = normalize_breakdown(raw, body.prd_text)
+        except AIServiceError as caught:
+            failure = caught
+        current = resume_after_ai_call(db, project_id, actor, 'ai.write')
+        result = save_ai_run(db, project_id, 'prd_breakdown', input_version, input_data,
+                             model_id or '', provider_url, current['id'], now(), output=output, failure=failure)
+        event(db, project_id, 'ai_run', str(result['id']), 'generation_failed' if failure else 'draft_created',
+              current['id'], None, {'run_id': result['id'], 'capability': 'prd_breakdown',
+                                    'status': result['status'], 'input_version': input_version}, touch_plan=False)
+        if failure:
+            response.status_code = failure.status_code
+        return result
+
+    @app.post('/api/projects/{project_id}/ai/forecasts', status_code=201)
+    def generate_forecast(project_id: int, body: AIForecastIn, response: Response,
+                          actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        if not {'task.read', 'history.read'}.issubset(actor['permissions']):
+            fail(403, '进度预测需要读取任务和历史的权限')
+        input_version = plan_state(db, project_id)['version']
+        evidence = forecast_calculation(db, project_id,
+            lambda pk: task(db, project_id, f'T-{pk:03d}'),
+            lambda user_id: capacity(db, project_id, user_id), body.as_of_date)
+        input_data = {'evidence': evidence}
+        settings = ai_settings()
+        model_id, provider_url = settings['model_id'], public_provider_url(settings['endpoint'])
+        db.commit()
+        failure = None
+        output = None
+        try:
+            raw, model_id, provider_url = call_structured('progress_forecast', forecast_prompt(), input_data)
+            output = {'evidence': evidence, 'explanation': validate_forecast_explanation(raw)}
+        except AIServiceError as caught:
+            failure = caught
+        current = resume_after_ai_call(db, project_id, actor, 'ai.write')
+        result = save_ai_run(db, project_id, 'progress_forecast', input_version, input_data,
+                             model_id or '', provider_url, current['id'], now(), output=output, failure=failure)
+        event(db, project_id, 'ai_run', str(result['id']), 'generation_failed' if failure else 'draft_created',
+              current['id'], None, {'run_id': result['id'], 'capability': 'progress_forecast',
+                                    'status': result['status'], 'input_version': input_version}, touch_plan=False)
+        if failure:
+            response.status_code = failure.status_code
+        return result
+
+    @app.post('/api/projects/{project_id}/ai/schedules', status_code=201)
+    def generate_ai_schedule(project_id: int, body: AIScheduleIn, response: Response,
+                             actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        if 'task.read' not in actor['permissions']:
+            fail(403, '智能排期需要读取任务的权限')
+        input_version = plan_state(db, project_id)['version']
+        calculation = schedule_calculation(db, project_id,
+            lambda pk: task(db, project_id, f'T-{pk:03d}'),
+            lambda user_id: capacity(db, project_id, user_id), body.start_date)
+        input_data = {'plan': calculation}
+        settings = ai_settings()
+        model_id, provider_url = settings['model_id'], public_provider_url(settings['endpoint'])
+        db.commit()
+        failure = None
+        output = None
+        try:
+            raw, model_id, provider_url = call_structured('smart_schedule', schedule_prompt(), input_data)
+            proposal_ids = [item['task_id'] for item in calculation['proposals']]
+            output = {'plan': calculation,
+                      'explanation': validate_schedule_explanation(raw, proposal_ids)}
+        except AIServiceError as caught:
+            failure = caught
+        current = resume_after_ai_call(db, project_id, actor, 'ai.write')
+        result = save_ai_run(db, project_id, 'smart_schedule', input_version, input_data,
+                             model_id or '', provider_url, current['id'], now(), output=output, failure=failure)
+        event(db, project_id, 'ai_run', str(result['id']), 'generation_failed' if failure else 'draft_created',
+              current['id'], None, {'run_id': result['id'], 'capability': 'smart_schedule',
+                                    'status': result['status'], 'input_version': input_version}, touch_plan=False)
+        if failure:
+            response.status_code = failure.status_code
+        return result
+
+    @app.post('/api/projects/{project_id}/ai/risks', status_code=201)
+    def generate_risk_analysis(project_id: int, body: AIRiskIn, response: Response,
+                               actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        if not {'task.read', 'history.read', 'statistics.read'}.issubset(actor['permissions']):
+            fail(403, '风险预警需要读取任务、历史和统计的权限')
+        current_thresholds = latest_risk_thresholds(db, project_id)
+        changed = (float(body.overload_percent) != float(current_thresholds['overload_percent'])
+                   or float(body.blocked_workdays) != float(current_thresholds['blocked_workdays']))
+        if current_thresholds['version'] == 0 or changed:
+            if changed and current_thresholds['version'] > 0 and not body.threshold_reason:
+                fail(422, '修改风险阈值必须填写原因')
+            threshold_version = current_thresholds['version'] + 1
+            threshold_reason = body.threshold_reason or '首次确认风险阈值'
+            db.execute('''INSERT INTO risk_threshold_versions(project_id,version,overload_percent,
+                blocked_workdays,changed_by,changed_at,reason) VALUES(?,?,?,?,?,?,?)''',
+                (project_id, threshold_version, body.overload_percent, body.blocked_workdays,
+                 actor['id'], now(), threshold_reason))
+            event(db, project_id, 'risk_threshold', str(threshold_version),
+                  'created' if current_thresholds['version'] == 0 else 'changed', actor['id'],
+                  current_thresholds if current_thresholds['version'] else None,
+                  {'version': threshold_version, 'overload_percent': body.overload_percent,
+                   'blocked_workdays': body.blocked_workdays}, threshold_reason, touch_plan=False)
+            current_thresholds = latest_risk_thresholds(db, project_id)
+        input_version = plan_state(db, project_id)['version']
+        evidence = risk_calculation(db, project_id,
+            lambda pk: task(db, project_id, f'T-{pk:03d}'),
+            lambda user_id: capacity(db, project_id, user_id),
+            {key_name: current_thresholds[key_name] for key_name in
+             ('version', 'overload_percent', 'blocked_workdays')}, body.as_of_date)
+        members = ai_members(db, project_id)
+        input_data = {'evidence': evidence, 'members': members}
+        settings = ai_settings()
+        model_id, provider_url = settings['model_id'], public_provider_url(settings['endpoint'])
+        db.commit()
+        failure = None
+        output = None
+        try:
+            raw, model_id, provider_url = call_structured('risk_analysis', risk_prompt(), input_data)
+            output = {'evidence': evidence, 'member_ids': [item['id'] for item in members],
+                      'analysis': validate_risk_analysis(raw, evidence, {item['id'] for item in members})}
+        except AIServiceError as caught:
+            failure = caught
+        current = resume_after_ai_call(db, project_id, actor, 'ai.write')
+        result = save_ai_run(db, project_id, 'risk_analysis', input_version, input_data,
+                             model_id or '', provider_url, current['id'], now(), output=output, failure=failure)
+        event(db, project_id, 'ai_run', str(result['id']), 'generation_failed' if failure else 'draft_created',
+              current['id'], None, {'run_id': result['id'], 'capability': 'risk_analysis',
+                                    'status': result['status'], 'input_version': input_version}, touch_plan=False)
+        if failure:
+            response.status_code = failure.status_code
+        return result
+
+    @app.post('/api/projects/{project_id}/ai/quality-analyses', status_code=201)
+    def generate_quality_analysis(project_id: int, body: AIQualityIn, response: Response,
+                                  actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        if not {'requirement.read', 'task.read'}.issubset(actor['permissions']):
+            fail(403, '质量分析需要读取需求和任务的权限')
+        target = requirement(db, project_id, body.target_requirement_id)
+        check_owner(db, project_id, body.owner_id)
+        artifacts = [item.model_dump(mode='json') for item in body.artifacts]
+        input_version = plan_state(db, project_id)['version']
+        input_data = {'target_requirement_id': target['id'], 'target_requirement_title': target['title'],
+                      'owner_id': body.owner_id, 'due_date': body.due_date.isoformat() if body.due_date else None,
+                      'artifacts': artifacts}
+        settings = ai_settings()
+        model_id, provider_url = settings['model_id'], public_provider_url(settings['endpoint'])
+        db.commit()
+        failure = None
+        output = None
+        try:
+            raw, model_id, provider_url = call_structured('quality_analysis', quality_prompt(), input_data)
+            output = {'artifacts': artifacts, 'analysis': validate_quality_analysis(raw, artifacts)}
+        except AIServiceError as caught:
+            failure = caught
+        current = resume_after_ai_call(db, project_id, actor, 'ai.write')
+        result = save_ai_run(db, project_id, 'quality_analysis', input_version, input_data,
+                             model_id or '', provider_url, current['id'], now(), output=output, failure=failure)
+        event(db, project_id, 'ai_run', str(result['id']), 'generation_failed' if failure else 'draft_created',
+              current['id'], None, {'run_id': result['id'], 'capability': 'quality_analysis',
+                                    'status': result['status'], 'input_version': input_version}, touch_plan=False)
+        if failure:
+            response.status_code = failure.status_code
+        return result
+
+    @app.post('/api/projects/{project_id}/ai/efficiency-analyses', status_code=201)
+    def generate_efficiency_analysis(project_id: int, body: AIEfficiencyIn, response: Response,
+                                     actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        if not {'task.read', 'history.read', 'statistics.read'}.issubset(actor['permissions']):
+            fail(403, '效率分析需要读取任务、历史和统计的权限')
+        input_version = plan_state(db, project_id)['version']
+        evidence = efficiency_calculation(db, project_id,
+            lambda pk: task(db, project_id, f'T-{pk:03d}'),
+            lambda user_id: capacity(db, project_id, user_id), body.as_of_date)
+        members = ai_members(db, project_id)
+        input_data = {'evidence': evidence, 'members': members}
+        settings = ai_settings()
+        model_id, provider_url = settings['model_id'], public_provider_url(settings['endpoint'])
+        db.commit()
+        failure = None
+        output = None
+        try:
+            raw, model_id, provider_url = call_structured('efficiency_analysis', efficiency_prompt(), input_data)
+            output = {'evidence': evidence, 'member_ids': [item['id'] for item in members],
+                      'analysis': validate_efficiency_analysis(raw, evidence, {item['id'] for item in members})}
+        except AIServiceError as caught:
+            failure = caught
+        current = resume_after_ai_call(db, project_id, actor, 'ai.write')
+        result = save_ai_run(db, project_id, 'efficiency_analysis', input_version, input_data,
+                             model_id or '', provider_url, current['id'], now(), output=output, failure=failure)
+        event(db, project_id, 'ai_run', str(result['id']), 'generation_failed' if failure else 'draft_created',
+              current['id'], None, {'run_id': result['id'], 'capability': 'efficiency_analysis',
+                                    'status': result['status'], 'input_version': input_version}, touch_plan=False)
+        if failure:
+            response.status_code = failure.status_code
+        return result
+
+    @app.patch('/api/projects/{project_id}/ai/runs/{run_id}')
+    def edit_ai_run(project_id: int, run_id: int, body: AIOutputEditIn,
+                    actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        old = load_ai_run(db, project_id, run_id)
+        if not old:
+            fail(404, 'AI 记录不存在')
+        if old['status'] != 'draft':
+            fail(409, '只有待审查草案可以修改')
+        if body.version != old['version']:
+            fail(409, 'AI 草案已被更新，请刷新后重试')
+        try:
+            output = validate_review_output(old['capability'], body.output, old['original_output'])
+        except AIServiceError as caught:
+            fail(caught.status_code, caught.message)
+        stamp = now()
+        db.execute('''UPDATE ai_runs SET edited_output_json=?,version=version+1,decision_reason=?
+            WHERE project_id=? AND id=?''',
+            (json.dumps(output, ensure_ascii=False), body.reason, project_id, run_id))
+        db.execute('''INSERT INTO ai_reviews(project_id,run_id,action,output_json,reason,actor_id,created_at)
+            VALUES(?,?,?,?,?,?,?)''',
+            (project_id, run_id, 'edited', json.dumps(output, ensure_ascii=False), body.reason,
+             actor['id'], stamp))
+        event(db, project_id, 'ai_run', str(run_id), 'draft_edited', actor['id'],
+              {'version': old['version']}, {'version': old['version'] + 1}, body.reason, touch_plan=False)
+        return load_ai_run(db, project_id, run_id)
+
+    @app.post('/api/projects/{project_id}/ai/runs/{run_id}/reject')
+    def reject_ai_run(project_id: int, run_id: int, body: AIReviewIn,
+                      actor=Depends(ai_writer), db=Depends(database, scope='function')):
+        old = load_ai_run(db, project_id, run_id)
+        if not old:
+            fail(404, 'AI 记录不存在')
+        if old['status'] != 'draft':
+            fail(409, '只有待审查草案可以否决')
+        if body.version != old['version']:
+            fail(409, 'AI 草案已被更新，请刷新后重试')
+        stamp = now()
+        db.execute('''UPDATE ai_runs SET status='rejected',version=version+1,decided_by=?,decided_at=?,
+            decision_reason=? WHERE project_id=? AND id=?''',
+            (actor['id'], stamp, body.reason, project_id, run_id))
+        db.execute('''INSERT INTO ai_reviews(project_id,run_id,action,output_json,reason,actor_id,created_at)
+            VALUES(?,?,?,?,?,?,?)''',
+            (project_id, run_id, 'rejected', json.dumps(old['output'], ensure_ascii=False),
+             body.reason, actor['id'], stamp))
+        event(db, project_id, 'ai_run', str(run_id), 'rejected', actor['id'],
+              {'status': 'draft'}, {'status': 'rejected'}, body.reason, touch_plan=False)
+        return load_ai_run(db, project_id, run_id)
+
+    @app.post('/api/projects/{project_id}/ai/runs/{run_id}/apply')
+    def apply_ai_run(project_id: int, run_id: int, body: AIReviewIn,
+                     actor=Depends(ai_applier), db=Depends(database, scope='function')):
+        if not body.operation_id:
+            fail(422, '确认应用必须提供操作标识')
+        existing = db.execute('SELECT id FROM ai_runs WHERE project_id=? AND applied_operation_id=?',
+                              (project_id, body.operation_id)).fetchone()
+        if existing:
+            if existing['id'] == run_id:
+                return load_ai_run(db, project_id, run_id)
+            fail(409, '操作标识已用于其他 AI 草案')
+        old = load_ai_run(db, project_id, run_id)
+        if not old:
+            fail(404, 'AI 记录不存在')
+        if old['status'] == 'applied':
+            fail(409, '此 AI 草案已经应用')
+        if old['status'] != 'draft':
+            fail(409, '只有待审查草案可以应用')
+        if body.version != old['version']:
+            fail(409, 'AI 草案已被更新，请刷新后重试')
+        if old['input_version'] != plan_state(db, project_id)['version']:
+            fail(409, '需求、任务、容量或排期已变化，请重新生成 AI 草案')
+        try:
+            output = validate_review_output(old['capability'], old['output'], old['original_output'])
+        except AIServiceError as caught:
+            fail(caught.status_code, caught.message)
+
+        stamp = now()
+        if old['capability'] == 'prd_breakdown':
+            if not {'requirement.write', 'task.write'}.issubset(actor['permissions']):
+                fail(403, '应用需求拆解需要需求和任务写权限')
+            if not output['stories']:
+                fail(422, '没有具备可定位来源的故事可应用')
+            local_tasks = {}
+            pending_dependencies = []
+            source_name = old['input']['source_name']
+            for story in output['stories']:
+                requirement_pk = db.execute('''INSERT INTO requirements(project_id,title,description,source,priority,
+                    acceptance_criteria,story_role,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)''',
+                    (project_id, story['story'], f"作为{story['role']}，{story['story']}",
+                     ('AI拆解 · ' + source_name)[:200], story['priority'],
+                     '\n'.join(story['acceptance_criteria']), story['role'], actor['id'], stamp)).lastrowid
+                created_requirement = requirement(db, project_id, f'REQ-{requirement_pk:03d}')
+                event(db, project_id, 'requirement', created_requirement['id'], 'ai_created', actor['id'], None,
+                      created_requirement, body.reason)
+                for draft_task in story['tasks']:
+                    task_pk = db.execute('''INSERT INTO tasks(project_id,requirement_pk,title,description,owner_id,
+                        sprint,estimated_hours,remaining_hours,required_skills_json,created_by,created_at,updated_at)
+                        VALUES(?,?,?,?,NULL,'S5',?,?,?,?,?,?)''',
+                        (project_id, requirement_pk, draft_task['title'], draft_task['description'],
+                         draft_task['estimate_hours'], draft_task['estimate_hours'],
+                         json.dumps(draft_task['required_skills'], ensure_ascii=False), actor['id'], stamp, stamp)).lastrowid
+                    local_tasks[draft_task['local_id']] = task_pk
+                    pending_dependencies.extend((draft_task['local_id'], dependency)
+                                                for dependency in draft_task['depends_on'])
+                    created_task = task(db, project_id, f'T-{task_pk:03d}')
+                    event(db, project_id, 'task', created_task['id'], 'ai_created', actor['id'], None,
+                          created_task, body.reason)
+            for local_task, local_dependency in pending_dependencies:
+                task_pk, dependency_pk = local_tasks[local_task], local_tasks[local_dependency]
+                db.execute('''INSERT INTO task_dependencies(project_id,task_pk,depends_on_pk,reason,created_by,created_at)
+                    VALUES(?,?,?,?,?,?)''',
+                    (project_id, task_pk, dependency_pk, 'AI 拆解建议经人工确认', actor['id'], stamp))
+                event(db, project_id, 'task_dependency', f'T-{task_pk:03d}:T-{dependency_pk:03d}',
+                      'dependency_added', actor['id'], None,
+                      {'task_id': f'T-{task_pk:03d}', 'depends_on_id': f'T-{dependency_pk:03d}'},
+                      body.reason)
+        elif old['capability'] == 'progress_forecast':
+            if 'task.read' not in actor['permissions']:
+                fail(403, '确认进度预测需要任务读取权限')
+        elif old['capability'] == 'smart_schedule':
+            if 'task.write' not in actor['permissions']:
+                fail(403, '应用智能排期需要任务写权限')
+            plan = output['plan']
+            if plan['blocked']:
+                fail(409, '排期仍有阻断冲突，不能应用')
+            changes = []
+            for proposal in plan['proposals']:
+                before = task(db, project_id, proposal['task_id'])
+                if before['cancelled'] or before['status'] != '待办' or before['plan_locked']:
+                    fail(409, f"{before['id']} 已不可由智能排期移动")
+                check_owner(db, project_id, proposal['after_owner_id'])
+                owner_capacity = capacity(db, project_id, proposal['after_owner_id'])
+                member_skills = {value.casefold() for value in owner_capacity['skill_tags']}
+                if not {value.casefold() for value in before['required_skills']}.issubset(member_skills):
+                    fail(422, f"{before['id']} 的建议负责人不满足技能要求")
+                db.execute('''UPDATE tasks SET owner_id=?,planned_start=?,planned_end=?,version=version+1,updated_at=?
+                    WHERE project_id=? AND pk=?''',
+                    (proposal['after_owner_id'], proposal['after_start'], proposal['after_end'], stamp,
+                     project_id, key(before['id'], 'T')))
+                after = task(db, project_id, before['id'])
+                changes.append((before, after))
+            if changes:
+                touch_plan_state(db, project_id, actor['id'], stamp)
+            for before, after in changes:
+                event(db, project_id, 'task', after['id'], 'ai_schedule_applied', actor['id'],
+                      before, after, body.reason, touch_plan=False)
+        elif old['capability'] == 'quality_analysis':
+            if 'task.write' not in actor['permissions']:
+                fail(403, '应用质量分析需要任务写权限')
+            target = requirement(db, project_id, old['input']['target_requirement_id'])
+            owner_id = old['input'].get('owner_id')
+            check_owner(db, project_id, owner_id)
+            for issue in output['analysis']['issues']:
+                description = ('AI质量分析经人工核实后转为任务\n'
+                    f"问题类型：{'缺陷' if issue['task_kind'] == 'defect' else '改进'}\n"
+                    f"来源：{issue['file_name']} · {issue['location']}\n"
+                    f"依据：{issue['evidence']}\n影响：{issue['impact']}\n建议：{issue['recommendation']}")[:10000]
+                task_pk = db.execute('''INSERT INTO tasks(project_id,requirement_pk,title,description,owner_id,
+                    due_date,sprint,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'S6',?,?,?)''',
+                    (project_id, key(target['id'], 'REQ'), issue['title'], description, owner_id,
+                     old['input'].get('due_date'), actor['id'], stamp, stamp)).lastrowid
+                created = task(db, project_id, f'T-{task_pk:03d}')
+                event(db, project_id, 'task', created['id'], 'quality_issue_created', actor['id'], None,
+                      created, body.reason)
+        elif old['capability'] in {'risk_analysis', 'efficiency_analysis'}:
+            advice_items = (output['analysis']['risks'] if old['capability'] == 'risk_analysis'
+                            else output['analysis']['bottlenecks'])
+            evidence_items = ({item['risk_id']: item for item in output['evidence']['risks']}
+                              if old['capability'] == 'risk_analysis'
+                              else {item['key']: item for item in output['evidence']['metrics']})
+            for advice in advice_items:
+                item_key = advice.get('risk_id') or advice['metric_key']
+                source = evidence_items[item_key]
+                owner_id = advice['owner_id']
+                check_owner(db, project_id, owner_id)
+                if old['capability'] == 'risk_analysis':
+                    title = source['title']
+                    description = f"{source['evidence']}\n应对建议：{advice['recommendation']}"
+                    due_date = advice['next_check_date']
+                    next_check_date = advice['next_check_date']
+                    metric_key = source['metric_key']
+                    metric_value = source['metric_value']
+                    review_metric = f"复核 {metric_key} 是否低于 {metric_value} {source['unit']}"
+                    source_kind = 'risk'
+                else:
+                    title = advice['action_title']
+                    description = f"瓶颈：{advice['bottleneck']}\n改进建议：{advice['recommendation']}"
+                    due_date = advice['due_date']
+                    next_check_date = advice['due_date']
+                    metric_key = advice['metric_key']
+                    metric_value = advice['metric_value']
+                    review_metric = advice['review_metric']
+                    source_kind = 'efficiency'
+                db.execute('''INSERT INTO improvement_actions(project_id,source_run_id,source_item_key,
+                    source_kind,title,description,owner_id,due_date,next_check_date,baseline_metric_key,
+                    baseline_metric_value,review_metric,created_by,created_at,updated_by,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (project_id, run_id, item_key, source_kind, title, description, owner_id,
+                     due_date, next_check_date, metric_key, metric_value, review_metric,
+                     actor['id'], stamp, actor['id'], stamp))
+        else:
+            fail(422, 'AI 能力类型无效')
+
+        db.execute('''UPDATE ai_runs SET status='applied',version=version+1,decided_by=?,decided_at=?,
+            decision_reason=?,applied_operation_id=? WHERE project_id=? AND id=?''',
+            (actor['id'], stamp, body.reason, body.operation_id, project_id, run_id))
+        db.execute('''INSERT INTO ai_reviews(project_id,run_id,action,output_json,reason,operation_id,actor_id,created_at)
+            VALUES(?,?,?,?,?,?,?,?)''',
+            (project_id, run_id, 'applied', json.dumps(output, ensure_ascii=False), body.reason,
+             body.operation_id, actor['id'], stamp))
+        event(db, project_id, 'ai_run', str(run_id), 'applied', actor['id'],
+              {'status': 'draft'}, {'status': 'applied', 'operation_id': body.operation_id},
+              body.reason, touch_plan=False)
+        return load_ai_run(db, project_id, run_id)
+
+    @app.patch('/api/projects/{project_id}/ai/actions/{action_id}')
+    def update_improvement_action(project_id: int, action_id: int, body: ImprovementActionEditIn,
+                                  actor=Depends(ai_applier), db=Depends(database, scope='function')):
+        old = improvement_action(db, project_id, action_id)
+        if body.version != old['version']:
+            fail(409, '改进行动已被更新，请刷新后重试')
+        if old['status'] == '已完成':
+            fail(409, '已完成行动保留为历史记录，不能重新打开')
+        if body.status == '已完成':
+            if body.current_metric_value is None or not body.review_note:
+                fail(422, '关闭行动必须填写复核指标和复核说明')
+            if body.current_metric_value >= old['baseline_metric_value']:
+                fail(409, '当前指标尚未优于行动创建时的基线，不能关闭')
+        stamp = now()
+        db.execute('''UPDATE improvement_actions SET status=?,current_metric_value=?,review_note=?,
+            version=version+1,updated_by=?,updated_at=?,completed_at=? WHERE project_id=? AND id=?''',
+            (body.status, body.current_metric_value, body.review_note, actor['id'], stamp,
+             stamp if body.status == '已完成' else None, project_id, action_id))
+        result = improvement_action(db, project_id, action_id)
+        event(db, project_id, 'improvement_action', str(action_id),
+              'completed' if body.status == '已完成' else 'status_changed', actor['id'], old,
+              result, body.review_note, touch_plan=False)
+        return result
+
+    @app.get('/api/projects/{project_id}/uml')
+    def uml_center(project_id: int, actor=Depends(uml_reader), db=Depends(database, scope='function')):
+        source_version = plan_state(db, project_id)['version']
+        use_case = latest_generation(db, project_id, 'use_case', 'project')
+        return {'source_version': source_version, 'use_case': use_case,
+                'use_case_stale': bool(use_case and use_case['source_version'] != source_version),
+                'scenarios': scenarios(db, project_id)}
+
+    @app.post('/api/projects/{project_id}/uml/use-case/generate')
+    def generate_use_case(project_id: int, body: UseCaseGenerateIn, actor=Depends(uml_writer),
+                          db=Depends(database, scope='function')):
+        if not {'requirement.read', 'task.read'}.issubset(actor['permissions']):
+            fail(403, '生成用例图需要读取需求和任务的权限')
+        source_version = plan_state(db, project_id)['version']
+        if body.source_version != source_version:
+            fail(409, '需求或任务已变化，请刷新UML来源后重试')
+        before = latest_generation(db, project_id, 'use_case', 'project')
+        content, warnings = build_use_case(
+            db, project_id,
+            lambda pk: requirement(db, project_id, f'REQ-{pk:03d}'),
+            lambda pk: task(db, project_id, f'T-{pk:03d}'))
+        project_name = db.execute('SELECT name FROM projects WHERE id=?', (project_id,)).fetchone()['name']
+        content['project_name'] = project_name
+        result = save_generation(db, project_id, 'use_case', 'project', source_version,
+                                 content, warnings, actor['id'], now())
+        event(db, project_id, 'uml_generation', f'use_case:{result["version"]}', 'generated',
+              actor['id'], before, result, touch_plan=False)
+        return result
+
+    @app.get('/api/projects/{project_id}/uml/scenarios')
+    def list_uml_scenarios(project_id: int, actor=Depends(uml_reader),
+                           db=Depends(database, scope='function')):
+        return scenarios(db, project_id)
+
+    @app.post('/api/projects/{project_id}/uml/scenarios', status_code=201)
+    def create_uml_scenario(project_id: int, body: SequenceScenarioIn, actor=Depends(uml_writer),
+                            db=Depends(database, scope='function')):
+        if 'task.read' not in actor['permissions']:
+            fail(403, '维护时序场景需要读取关联任务的权限')
+        participants, messages = validated_scenario_payload(project_id, body, db)
+        stamp = now()
+        try:
+            scenario_id = db.execute('''INSERT INTO uml_scenarios(project_id,name,description,participants_json,
+                messages_json,created_by,created_at,updated_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?)''',
+                (project_id, body.name, body.description,
+                 json.dumps(participants, ensure_ascii=False), json.dumps(messages, ensure_ascii=False),
+                 actor['id'], stamp, actor['id'], stamp)).lastrowid
+        except sqlite3.IntegrityError:
+            fail(409, '场景名称已存在')
+        result = scenario(db, project_id, scenario_id)
+        event(db, project_id, 'uml_scenario', str(scenario_id), 'created', actor['id'], None, result,
+              touch_plan=False)
+        return result
+
+    @app.get('/api/projects/{project_id}/uml/scenarios/{scenario_id}')
+    def get_uml_scenario(project_id: int, scenario_id: int, actor=Depends(uml_reader),
+                         db=Depends(database, scope='function')):
+        result = scenario(db, project_id, scenario_id)
+        if not result:
+            fail(404, 'UML场景不存在')
+        return result
+
+    @app.patch('/api/projects/{project_id}/uml/scenarios/{scenario_id}')
+    def edit_uml_scenario(project_id: int, scenario_id: int, body: SequenceScenarioEdit,
+                          actor=Depends(uml_writer), db=Depends(database, scope='function')):
+        if 'task.read' not in actor['permissions']:
+            fail(403, '维护时序场景需要读取关联任务的权限')
+        old = scenario(db, project_id, scenario_id)
+        if not old:
+            fail(404, 'UML场景不存在')
+        if body.version != old['version']:
+            fail(409, 'UML场景已被更新，请刷新后重试')
+        participants, messages = validated_scenario_payload(project_id, body, db)
+        stamp = now()
+        try:
+            db.execute('''UPDATE uml_scenarios SET name=?,description=?,participants_json=?,messages_json=?,
+                version=version+1,updated_by=?,updated_at=? WHERE project_id=? AND id=?''',
+                (body.name, body.description, json.dumps(participants, ensure_ascii=False),
+                 json.dumps(messages, ensure_ascii=False), actor['id'], stamp, project_id, scenario_id))
+        except sqlite3.IntegrityError:
+            fail(409, '场景名称已存在')
+        result = scenario(db, project_id, scenario_id)
+        event(db, project_id, 'uml_scenario', str(scenario_id), 'updated', actor['id'], old, result,
+              touch_plan=False)
+        return result
+
+    @app.post('/api/projects/{project_id}/uml/scenarios/{scenario_id}/generate')
+    def generate_sequence(project_id: int, scenario_id: int, body: SequenceGenerateIn,
+                          actor=Depends(uml_writer), db=Depends(database, scope='function')):
+        if 'task.read' not in actor['permissions']:
+            fail(403, '生成时序图需要读取关联任务的权限')
+        source = scenario(db, project_id, scenario_id)
+        if not source:
+            fail(404, 'UML场景不存在')
+        if body.scenario_version != source['version']:
+            fail(409, 'UML场景已被更新，请刷新后重试')
+        # Revalidate persisted structured data before appending a generation version.
+        participants = source['participants']
+        participant_names = set(participants)
+        for index, message in enumerate(source['messages'], start=1):
+            if message['from_participant'] not in participant_names or message['to_participant'] not in participant_names:
+                fail(422, f'第{index}条消息引用了无效参与者')
+            if not message.get('task_id'):
+                fail(422, f'第{index}条消息缺少来源任务ID')
+        content = build_sequence(source, lambda task_id: task(db, project_id, task_id))
+        before = source['latest_generation']
+        result = save_generation(db, project_id, 'sequence', f'scenario:{scenario_id}', source['version'],
+                                 content, [], actor['id'], now())
+        event(db, project_id, 'uml_generation', f'sequence:{scenario_id}:{result["version"]}',
+              'generated', actor['id'], before, result, touch_plan=False)
+        return result
 
     @app.get('/api/projects/{project_id}/tasks')
     def tasks(project_id: int, q: str = '', status: str = '', owner_id: str = '',
@@ -771,10 +1434,11 @@ def create_app(db_path=None):
         if body.version != old['version']:
             fail(409, '任务已被更新，请刷新后重试')
         db.execute('''UPDATE tasks SET estimated_hours=?,actual_hours=?,remaining_hours=?,planned_start=?,
-            planned_end=?,plan_locked=?,version=version+1,updated_at=? WHERE project_id=? AND pk=?''',
+            planned_end=?,plan_locked=?,required_skills_json=?,version=version+1,updated_at=? WHERE project_id=? AND pk=?''',
             (body.estimated_hours, body.actual_hours, body.remaining_hours,
              body.planned_start.isoformat() if body.planned_start else None,
-             body.planned_end.isoformat() if body.planned_end else None, int(body.plan_locked), now(),
+             body.planned_end.isoformat() if body.planned_end else None, int(body.plan_locked),
+             json.dumps(body.required_skills, ensure_ascii=False), now(),
              project_id, key(task_id, 'T')))
         result = task(db, project_id, task_id)
         event(db, project_id, 'task', task_id, 'plan_updated', actor['id'], old, result, body.reason.strip())

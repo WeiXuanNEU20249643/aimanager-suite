@@ -5,6 +5,15 @@
 backend/data/
 artifacts/
 *.sqlite3*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
 .env
+.env.*
+!.env.example
+
+# Local business imports, account handover, and verification outputs stay private.
+.local/
 
 .idea/
